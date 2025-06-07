@@ -1,0 +1,180 @@
+name: Build and Package 15-Puzzle Game
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+          choco install wixtoolset -y
+       
+      - name: Download and extract SFML
+        run: |
+          if (-not (Test-Path "C:/tools")) {
+              New-Item -ItemType Directory -Path "C:/tools" | Out-Null
+          }
+          
+          $url = "https://www.sfml-dev.org/files/SFML-2.6.1-windows-vc17-64-bit.zip"
+          $downloadPath = "$env:RUNNER_TEMP/sfml.zip"
+          
+          try {
+              Write-Host "Downloading SFML from $url"
+              Invoke-WebRequest -Uri $url -OutFile $downloadPath -ErrorAction Stop
+              
+              Write-Host "Extracting SFML to C:/tools/SFML"
+              Expand-Archive -Path $downloadPath -DestinationPath "C:/tools" -ErrorAction Stop
+              
+              $extractedDir = Get-ChildItem "C:/tools" -Directory | Where-Object { $_.Name -like "SFML-*" }
+              if ($extractedDir) {
+                  Rename-Item -Path $extractedDir.FullName -NewName "SFML" -ErrorAction Stop
+              }
+              
+              $sfmlBinPath = "C:/tools/SFML/bin"
+              if (Test-Path $sfmlBinPath) {
+                  echo "$sfmlBinPath" | Out-File -FilePath $env:GITHUB_PATH -Append
+              } else {
+                  Write-Error "SFML binaries directory not found after extraction"
+                  exit 1
+              }
+          } catch {
+              Write-Error "Failed to download or extract SFML: $_"
+              exit 1
+          }
+          finally {
+              if (Test-Path $downloadPath) {
+                  Remove-Item $downloadPath -Force
+              }
+          }
+    
+      - name: Verify SFML installation
+        run: |
+          $sfmlPath = "C:/tools/SFML"
+          if (-not (Test-Path $sfmlPath)) {
+              Write-Error "SFML not found at $sfmlPath"
+              exit 1
+          }
+          
+          Write-Host "SFML directory contents:"
+          Get-ChildItem $sfmlPath -Recurse | Select-Object FullName | Out-Host
+          
+          $requiredDlls = @("sfml-graphics-2.dll", "sfml-window-2.dll", "sfml-system-2.dll")
+          foreach ($dll in $requiredDlls) {
+              if (-not (Test-Path "$sfmlPath/bin/$dll")) {
+                  Write-Error "Required SFML DLL not found: $dll"
+                  exit 1
+              }
+          }
+          
+      - name: Build with CMake
+        run: |
+          mkdir build
+          cd build
+          cmake -DSFML_DIR="C:/tools/SFML/lib/cmake/SFML" ..
+          cmake --build . --config Release
+          
+      - name: Prepare package files
+        run: |
+          $sfmlBinPath = "C:/tools/SFML/bin"
+          $installDir = "pkg/INSTALLDIR"
+          
+          New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+          Copy-Item -Path "build/Release/15puzzle.exe" -Destination "$installDir/" -ErrorAction Stop
+          
+          $requiredDlls = @(
+              "sfml-graphics-2.dll",
+              "sfml-window-2.dll",
+              "sfml-system-2.dll"
+          )
+          
+          foreach ($dll in $requiredDlls) {
+              $sourcePath = "$sfmlBinPath/$dll"
+              if (Test-Path $sourcePath) {
+                  Copy-Item -Path $sourcePath -Destination "$installDir/" -ErrorAction Stop
+              } else {
+                  Write-Error "DLL file not found: $sourcePath"
+                  exit 1
+              }
+          }
+          
+          if (Test-Path "images") {
+              New-Item -ItemType Directory -Path "$installDir/images" -Force | Out-Null
+              Copy-Item -Path "images/*" -Destination "$installDir/images/" -ErrorAction Stop
+          } else {
+              Write-Error "Images directory not found"
+              exit 1
+          }
+          
+      - name: Create MSI package
+        run: |
+          $componentGuid = [guid]::NewGuid().ToString().ToUpper()
+          $upgradeGuid = [guid]::NewGuid().ToString().ToUpper()
+          
+          $productWxs = @"
+          <?xml version="1.0"?>
+          <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+            <Product 
+              Id="*" 
+              Name="15-Puzzle Game" 
+              Version="1.0" 
+              Manufacturer="YourName" 
+              Language="1033"
+              UpgradeCode="$upgradeGuid">
+              <Package InstallerVersion="200" Compressed="yes"/>
+              <MediaTemplate EmbedCab="yes"/>
+              
+              <Directory Id="TARGETDIR" Name="SourceDir">
+                <Directory Id="ProgramFilesFolder">
+                  <Directory Id="INSTALLDIR" Name="15-Puzzle">
+                    <Component Id="MainComponent" Guid="$componentGuid">
+                      <File Id="GameEXE" Source="pkg/INSTALLDIR/15puzzle.exe" KeyPath="yes"/>
+                      <File Id="SFMLGraphicsDLL" Source="pkg/INSTALLDIR/sfml-graphics-2.dll"/>
+                      <File Id="SFMLWindowDLL" Source="pkg/INSTALLDIR/sfml-window-2.dll"/>
+                      <File Id="SFMLSystemDLL" Source="pkg/INSTALLDIR/sfml-system-2.dll"/>
+                    </Component>
+                    
+                    <Directory Id="ImagesDir" Name="images">
+                      <Component Id="ImagesComponent" Guid="$([guid]::NewGuid().ToString().ToUpper())">
+                        <File Id="GameImage" Source="pkg/INSTALLDIR/images/15.png"/>
+                      </Component>
+                    </Directory>
+                  </Directory>
+                </Directory>
+              </Directory>
+              
+              <Feature Id="MainFeature" Title="Main Feature" Level="1">
+                <ComponentRef Id="MainComponent"/>
+                <ComponentRef Id="ImagesComponent"/>
+              </Feature>
+              
+              <UIRef Id="WixUI_Minimal"/>
+            </Product>
+          </Wix>
+          "@
+          
+          Set-Content -Path product.wxs -Value $productWxs
+          
+          # Compile the installer
+          candle.exe product.wxs
+          light.exe product.wixobj -ext WixUIExtension -out 15-puzzle.msi
+          
+          if (Test-Path 15-puzzle.msi) {
+              Write-Host "MSI package created successfully!"
+          } else {
+              Write-Error "Failed to create MSI package!"
+              exit 1
+          }
+    
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 15-puzzle-msi
+          path: 15-puzzle.msi
